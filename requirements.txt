@@ -1,0 +1,6 @@
+h5py
+imageio
+Pillow
+opencv-python
+nltk
+tqdm

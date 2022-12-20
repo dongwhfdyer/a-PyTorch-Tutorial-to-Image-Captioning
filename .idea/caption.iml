@@ -2,7 +2,7 @@
 <module type="PYTHON_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$" />
-    <orderEntry type="jdk" jdkName="Python 3.6 (general)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Remote Python 3.10.8 (sftp://zx@120.26.167.153:8031/home/zx/miniconda3/envs/th13/bin/python)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="TestRunnerService">

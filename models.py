@@ -15,7 +15,6 @@ class Encoder(nn.Module):
         self.enc_image_size = encoded_image_size
 
         resnet = torchvision.models.resnet101(pretrained=True)  # pretrained ImageNet ResNet-101
-
         # Remove linear and pool layers (since we're not doing classification)
         modules = list(resnet.children())[:-2]
         self.resnet = nn.Sequential(*modules)
@@ -32,9 +31,12 @@ class Encoder(nn.Module):
         :param images: images, a tensor of dimensions (batch_size, 3, image_size, image_size)
         :return: encoded images
         """
-        out = self.resnet(images)  # (batch_size, 2048, image_size/32, image_size/32)
-        out = self.adaptive_pool(out)  # (batch_size, 2048, encoded_image_size, encoded_image_size)
-        out = out.permute(0, 2, 3, 1)  # (batch_size, encoded_image_size, encoded_image_size, 2048)
+        # (batch_size, 3, image_size, image_size) -> (batch_size, 2048, image_size/32, image_size/32)
+        out = self.resnet(images)
+        # (batch_size, 2048, image_size / 32, image_size / 32) -> (batch_size, 2048, encoded_image_size, encoded_image_size)
+        out = self.adaptive_pool(out)
+        # (batch_size, 2048, encoded_image_size, encoded_image_size) -> (batch_size, encoded_image_size, encoded_image_size, 2048)
+        out = out.permute(0, 2, 3, 1)
         return out
 
     def fine_tune(self, fine_tune=True):
@@ -79,6 +81,7 @@ class Attention(nn.Module):
         """
         att1 = self.encoder_att(encoder_out)  # (batch_size, num_pixels, attention_dim)
         att2 = self.decoder_att(decoder_hidden)  # (batch_size, attention_dim)
+        dd = att1 + att2.unsqueeze(1)  # (batch_size, num_pixels, attention_dim)
         att = self.full_att(self.relu(att1 + att2.unsqueeze(1))).squeeze(2)  # (batch_size, num_pixels)
         alpha = self.softmax(att)  # (batch_size, num_pixels)
         attention_weighted_encoding = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)  # (batch_size, encoder_dim)
@@ -152,10 +155,10 @@ class DecoderWithAttention(nn.Module):
 
         :param encoder_out: encoded images, a tensor of dimension (batch_size, num_pixels, encoder_dim)
         :return: hidden state, cell state
-        """
+        """  # (batch_size, num_pixels, encoder_dim) -> (batch_size, encoder_dim)
         mean_encoder_out = encoder_out.mean(dim=1)
         h = self.init_h(mean_encoder_out)  # (batch_size, decoder_dim)
-        c = self.init_c(mean_encoder_out)
+        c = self.init_c(mean_encoder_out)  # (batch_size, decoder_dim)
         return h, c
 
     def forward(self, encoder_out, encoded_captions, caption_lengths):
@@ -173,42 +176,80 @@ class DecoderWithAttention(nn.Module):
         vocab_size = self.vocab_size
 
         # Flatten image
-        encoder_out = encoder_out.view(batch_size, -1, encoder_dim)  # (batch_size, num_pixels, encoder_dim)
+        # (batch_size, enc_image_size, enc_image_size, encoder_dim) -> (batch_size, num_pixels, encoder_dim)
+        encoder_out = encoder_out.view(batch_size, -1, encoder_dim)
         num_pixels = encoder_out.size(1)
 
         # Sort input data by decreasing lengths; why? apparent below
+        # caption_lengths: (batch_size, )
         caption_lengths, sort_ind = caption_lengths.squeeze(1).sort(dim=0, descending=True)
         encoder_out = encoder_out[sort_ind]
+        # encoded_captions: (batch_size, max_caption_length)
         encoded_captions = encoded_captions[sort_ind]
 
-        # Embedding
-        embeddings = self.embedding(encoded_captions)  # (batch_size, max_caption_length, embed_dim)
+        # (batch_size, max_caption_length) -> (batch_size, max_caption_length, embed_dim)
+        embeddings = self.embedding(encoded_captions)
 
         # Initialize LSTM state
-        h, c = self.init_hidden_state(encoder_out)  # (batch_size, decoder_dim)
+        # encoder_out: (batch_size, num_pixels, encoder_dim)
+        # h: (batch_size, decoder_dim)
+        # c: (batch_size, decoder_dim)
+        h, c = self.init_hidden_state(encoder_out)
 
         # We won't decode at the <end> position, since we've finished generating as soon as we generate <end>
-        # So, decoding lengths are actual lengths - 1
+        # So, decoding lengths are actual lengths - 1 # kuhn: actually, the caption_lengths should not be known. it's groundtruth.
         decode_lengths = (caption_lengths - 1).tolist()
 
-        # Create tensors to hold word predicion scores and alphas
+        # Create tensors to hold word predicion scores and alphas # predictions' structure: (batch_size, max_caption_length, vocab_size)
         predictions = torch.zeros(batch_size, max(decode_lengths), vocab_size).to(device)
-        alphas = torch.zeros(batch_size, max(decode_lengths), num_pixels).to(device)
+        alphas = torch.zeros(batch_size, max(decode_lengths), num_pixels).to(device)  # alphas means attention weights
 
         # At each time-step, decode by
         # attention-weighing the encoder's output based on the decoder's previous hidden state output
         # then generate a new word in the decoder with the previous word and the attention weighted encoding
         for t in range(max(decode_lengths)):
+            # Every time step, We are trying to predict the next word based on the previous result and it will process the batch together.
+            # But Different items in the batch have different lengths. So we have to know the dynamic real batch size in each time step.
             batch_size_t = sum([l > t for l in decode_lengths])
-            attention_weighted_encoding, alpha = self.attention(encoder_out[:batch_size_t],
-                                                                h[:batch_size_t])
+            # attention_weighted_encoding: (batch_size_t, encoder_dim). This nis image encoding uder the action of attention mechanism.
+            # alpha: (batch_size_t, num_pixels)
+            attention_weighted_encoding, alpha = self.attention(encoder_out[:batch_size_t], h[:batch_size_t])  # It only process the real batch size.
             gate = self.sigmoid(self.f_beta(h[:batch_size_t]))  # gating scalar, (batch_size_t, encoder_dim)
             attention_weighted_encoding = gate * attention_weighted_encoding
+            # x:
+            # x: (batch_size_t, embed_dim + encoder_dim) torch.cat([embeddings[:batch_size_t, t, :], attention_weighted_encoding], dim=1)
+            # Kuhn: Very important: the input of LSTM is the concatenation of the word embedding and the image encoding under the action of attention mechanism.
+            # The inputted word embedding is the word embedding of the previous time step. And the word embedding is groundtruth!!
+            # Teacher forcing: Feed the groundTruth as the next input. This is the key point of the training process.
             h, c = self.decode_step(
                 torch.cat([embeddings[:batch_size_t, t, :], attention_weighted_encoding], dim=1),
                 (h[:batch_size_t], c[:batch_size_t]))  # (batch_size_t, decoder_dim)
+            # Kuhn: why it is based on the hidden state of LSTM? Because the hidden state of LSTM is the output of the last time step.
+            # Kuhn: why not the cell state? Because the cell state is the memory of LSTM. It is not the output of LSTM.
             preds = self.fc(self.dropout(h))  # (batch_size_t, vocab_size)
             predictions[:batch_size_t, t, :] = preds
             alphas[:batch_size_t, t, :] = alpha
 
         return predictions, encoded_captions, decode_lengths, alphas, sort_ind
+
+
+if __name__ == '__main__':
+    emb_dim = 512  # dimension of word embeddings
+    attention_dim = 512  # dimension of attention linear layers
+    decoder_dim = 512
+    vocab_size = 10000
+    dropout = 0.5
+    batch_size = 8
+    enc_imgsiz = 256
+    encoder_dim = 768
+    caption_len = 30
+    decoder = DecoderWithAttention(attention_dim=attention_dim,
+                                   embed_dim=emb_dim,
+                                   decoder_dim=decoder_dim,
+                                   vocab_size=vocab_size,
+                                   dropout=dropout)
+    encoder_out_rand = torch.rand([batch_size, enc_imgsiz, enc_imgsiz, encoder_dim])
+    encoder_captions_rand = torch.randn([batch_size, caption_len])
+    caption_lengths_rand = torch.Tensor([3])
+    caption_lengths_rand = caption_lengths_rand.repeat(batch_size)
+    res = decoder(encoder_out_rand, encoder_captions_rand, caption_lengths_rand)

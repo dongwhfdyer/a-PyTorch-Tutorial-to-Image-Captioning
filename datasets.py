@@ -25,7 +25,7 @@ class CaptionDataset(Dataset):
         self.imgs = self.h['images']
 
         # Captions per image
-        self.cpi = self.h.attrs['captions_per_image']
+        self.cpi = self.h.attrs['captions_per_image'] # 5
 
         # Load encoded captions (completely into memory)
         with open(os.path.join(data_folder, self.split + '_CAPTIONS_' + data_name + '.json'), 'r') as j:
@@ -51,7 +51,7 @@ class CaptionDataset(Dataset):
 
         caplen = torch.LongTensor([self.caplens[i]])
 
-        if self.split is 'TRAIN':
+        if self.split == 'TRAIN':
             return img, caption, caplen
         else:
             # For validation of testing, also return all 'captions_per_image' captions to find BLEU-4 score

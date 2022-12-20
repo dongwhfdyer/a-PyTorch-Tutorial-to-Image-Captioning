@@ -11,7 +11,7 @@ from utils import *
 from nltk.translate.bleu_score import corpus_bleu
 
 # Data parameters
-data_folder = '/media/ssd/caption data'  # folder with data files saved by create_input_files.py
+data_folder = 'outputs'  # folder with data files saved by create_input_files.py
 data_name = 'coco_5_cap_per_img_5_min_word_freq'  # base name shared by data files
 
 # Model parameters
@@ -34,7 +34,7 @@ grad_clip = 5.  # clip gradients at an absolute value of
 alpha_c = 1.  # regularization parameter for 'doubly stochastic attention', as in the paper
 best_bleu4 = 0.  # BLEU-4 score right now
 print_freq = 100  # print training/validation stats every __ batches
-fine_tune_encoder = False  # fine-tune encoder?
+if_fine_tune_encoder = False  # fine-tune encoder?
 checkpoint = None  # path to checkpoint, None if none
 
 
@@ -43,7 +43,7 @@ def main():
     Training and validation.
     """
 
-    global best_bleu4, epochs_since_improvement, checkpoint, start_epoch, fine_tune_encoder, data_name, word_map
+    global best_bleu4, epochs_since_improvement, checkpoint, start_epoch, if_fine_tune_encoder, data_name, word_map
 
     # Read word map
     word_map_file = os.path.join(data_folder, 'WORDMAP_' + data_name + '.json')
@@ -57,12 +57,11 @@ def main():
                                        decoder_dim=decoder_dim,
                                        vocab_size=len(word_map),
                                        dropout=dropout)
-        decoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, decoder.parameters()),
-                                             lr=decoder_lr)
+        decoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, decoder.parameters()), lr=decoder_lr)
         encoder = Encoder()
-        encoder.fine_tune(fine_tune_encoder)
+        encoder.fine_tune(if_fine_tune_encoder)
         encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
-                                             lr=encoder_lr) if fine_tune_encoder else None
+                                             lr=encoder_lr) if if_fine_tune_encoder else None
 
     else:
         checkpoint = torch.load(checkpoint)
@@ -73,8 +72,8 @@ def main():
         decoder_optimizer = checkpoint['decoder_optimizer']
         encoder = checkpoint['encoder']
         encoder_optimizer = checkpoint['encoder_optimizer']
-        if fine_tune_encoder is True and encoder_optimizer is None:
-            encoder.fine_tune(fine_tune_encoder)
+        if if_fine_tune_encoder is True and encoder_optimizer is None:
+            encoder.fine_tune(if_fine_tune_encoder)
             encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
                                                  lr=encoder_lr)
 
@@ -86,8 +85,7 @@ def main():
     criterion = nn.CrossEntropyLoss().to(device)
 
     # Custom dataloaders
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     train_loader = torch.utils.data.DataLoader(
         CaptionDataset(data_folder, data_name, 'TRAIN', transform=transforms.Compose([normalize])),
         batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True)
@@ -103,7 +101,7 @@ def main():
             break
         if epochs_since_improvement > 0 and epochs_since_improvement % 8 == 0:
             adjust_learning_rate(decoder_optimizer, 0.8)
-            if fine_tune_encoder:
+            if if_fine_tune_encoder:
                 adjust_learning_rate(encoder_optimizer, 0.8)
 
         # One epoch's training
@@ -167,17 +165,31 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
         caps = caps.to(device)
         caplens = caplens.to(device)
 
-        # Forward prop.
-        imgs = encoder(imgs)
+        # Change the image to a feature tensor
+        imgs = encoder(imgs)  # (batch_size, enc_image_size, enc_image_size, encoder_dim)
+        # Every batch, we will not only get the final prediction scores, but also the attention weights, captions lengths sorting indices, the sorted captions lengths, and the sorted captions.
+        # scores: [batch_size, seq_len, vocab_size]
+        # caps_sorted: [batch_size, seq_len]
+        # decode_lengths: [batch_size]
+        # alphas: [batch_size, seq_len, enc_image_size * enc_image_size]
+        # sort_ind: [batch_size]
         scores, caps_sorted, decode_lengths, alphas, sort_ind = decoder(imgs, caps, caplens)
 
         # Since we decoded starting with <start>, the targets are all words after <start>, up to <end>
+        # targets: [batch_size, seq_len - 1]
         targets = caps_sorted[:, 1:]
 
         # Remove timesteps that we didn't decode at, or are pads
         # pack_padded_sequence is an easy trick to do this
-        scores, _ = pack_padded_sequence(scores, decode_lengths, batch_first=True)
-        targets, _ = pack_padded_sequence(targets, decode_lengths, batch_first=True)
+        # kuhn: https://stackoverflow.com/questions/51030782/why-do-we-pack-the-sequences-in-pytorch
+        # One for computational efficiency, and one for numerical stability.
+        # The latter is because many function is like w*x+b. So even if the x is a zero vector, the b is still added.
+        # When baias added up, it will be a big number.
+
+        # scores: [packed_seq_len, vocab_size] (packed_seq_len < batch_size * seq_len)
+        scores, *_ = pack_padded_sequence(scores, decode_lengths, batch_first=True)
+        # targets: [packed_seq_len]. The targets is transformed based on decode_lengths.
+        targets, *_ = pack_padded_sequence(targets, decode_lengths, batch_first=True)
 
         # Calculate loss
         loss = criterion(scores, targets)
@@ -246,7 +258,6 @@ def validate(val_loader, encoder, decoder, criterion):
     hypotheses = list()  # hypotheses (predictions)
 
     # explicitly disable gradient calculation to avoid CUDA memory error
-    # solves the issue #57
     with torch.no_grad():
         # Batches
         for i, (imgs, caps, caplens, allcaps) in enumerate(val_loader):
@@ -267,6 +278,7 @@ def validate(val_loader, encoder, decoder, criterion):
             # Remove timesteps that we didn't decode at, or are pads
             # pack_padded_sequence is an easy trick to do this
             scores_copy = scores.clone()
+            # kuhn: https://stackoverflow.com/questions/51030782/why-do-we-pack-the-sequences-in-pytorch
             scores, _ = pack_padded_sequence(scores, decode_lengths, batch_first=True)
             targets, _ = pack_padded_sequence(targets, decode_lengths, batch_first=True)
 
@@ -328,4 +340,5 @@ def validate(val_loader, encoder, decoder, criterion):
 
 
 if __name__ == '__main__':
+    print("hey")
     main()
