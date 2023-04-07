@@ -232,6 +232,10 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
                                                                           batch_time=batch_time,
                                                                           data_time=data_time, loss=losses,
                                                                           top5=top5accs))
+        if i == 300:
+            print("if you see this, delete it.")
+            break
+
 
 
 def validate(val_loader, encoder, decoder, criterion):
@@ -266,6 +270,7 @@ def validate(val_loader, encoder, decoder, criterion):
             imgs = imgs.to(device)
             caps = caps.to(device)
             caplens = caplens.to(device)
+            allcaps = allcaps.to(device)
 
             # Forward prop.
             if encoder is not None:
@@ -279,8 +284,8 @@ def validate(val_loader, encoder, decoder, criterion):
             # pack_padded_sequence is an easy trick to do this
             scores_copy = scores.clone()
             # kuhn: https://stackoverflow.com/questions/51030782/why-do-we-pack-the-sequences-in-pytorch
-            scores, _ = pack_padded_sequence(scores, decode_lengths, batch_first=True)
-            targets, _ = pack_padded_sequence(targets, decode_lengths, batch_first=True)
+            scores, *_ = pack_padded_sequence(scores, decode_lengths, batch_first=True)
+            targets, *_ = pack_padded_sequence(targets, decode_lengths, batch_first=True)
 
             # Calculate loss
             loss = criterion(scores, targets)
@@ -311,11 +316,11 @@ def validate(val_loader, encoder, decoder, criterion):
             allcaps = allcaps[sort_ind]  # because images were sorted in the decoder
             for j in range(allcaps.shape[0]):
                 img_caps = allcaps[j].tolist()
+                # img_captions: [batch_size, 5, different_length!!]
                 img_captions = list(
                     map(lambda c: [w for w in c if w not in {word_map['<start>'], word_map['<pad>']}],
                         img_caps))  # remove <start> and pads
                 references.append(img_captions)
-
             # Hypotheses
             _, preds = torch.max(scores_copy, dim=2)
             preds = preds.tolist()
